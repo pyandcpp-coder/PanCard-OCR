@@ -416,11 +416,23 @@ async def process_pan_base64(request: Base64ImageRequest):
 
 @app.post("/process_pan_path")
 async def process_pan_path(request: ImagePathRequest):
-    """Process PAN card from file path"""
+    """Process PAN card from file path or URL"""
     try:
-        result = processor.process_pan_card(request.image_path)
+        import requests
+        if request.image_path.startswith("http://") or request.image_path.startswith("https://"):
+            response = requests.get(request.image_path, timeout=10)
+            if response.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to fetch image from URL")
+            
+            temp_path = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            with open(temp_path, 'wb') as f:
+                f.write(response.content)
+            result = processor.process_pan_card(temp_path)
+            os.remove(temp_path)
+        else:
+            result = processor.process_pan_card(request.image_path)
+
         return result
-    
     except Exception as e:
         logger.error(f"API Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
