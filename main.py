@@ -340,12 +340,13 @@ class CleanPANProcessor:
                 
                 output[field_name] = extracted_text
                 logger.info(f"✅ {field_name}: {extracted_text if extracted_text else 'Not found'} (conf: {detection['confidence']:.3f})")
-            
+            output["status"] = any(v is not None for k, v in output.items() if k != "status")
+
             return output
             
         except Exception as e:
             logger.error(f"Error processing PAN card: {str(e)}")
-            return {"pan": "", "name": "", "father": "", "dob": ""}
+            return {"pan": "", "name": "", "father": "", "dob": "","status":False}
 
 # FastAPI app setup
 app = FastAPI(title="Clean PAN Card Processing API", version="6.0.0")
