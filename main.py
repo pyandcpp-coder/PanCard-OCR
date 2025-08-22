@@ -45,6 +45,9 @@ class CleanPANProcessor:
         self.model = YOLO(model_path)
         logger.info(f"✅ YOLO model loaded successfully from {model_path}")
         
+        # Define confidence threshold for poor detections
+        self.MIN_CONFIDENCE_THRESHOLD = 0.35  # Below this, consider as "pan_notfound"
+        
         self._check_tesseract()
     
     def _check_tesseract(self):
@@ -56,9 +59,10 @@ class CleanPANProcessor:
             logger.critical("❌ Tesseract not found. Please install Tesseract OCR.")
             raise RuntimeError("Tesseract not found")
     
-    def _try_detection_with_rotation(self, image: np.ndarray) -> Tuple[Any, np.ndarray, int]:
+    def _try_detection_with_rotation(self, image: np.ndarray) -> Tuple[Any, np.ndarray, int, float]:
         """
         Try YOLO detection with automatic rotation correction
+        Returns: (results, corrected_image, rotation_used, avg_confidence)
         """
         # First try without rotation
         results = self.model.predict(
@@ -87,7 +91,7 @@ class CleanPANProcessor:
         # If good detections, use them
         if detection_count >= 3 and avg_confidence > 0.6:
             logger.info(f"✅ Good detections without rotation: {detection_count} fields, avg conf: {avg_confidence:.3f}")
-            return results, image, 0
+            return results, image, 0, avg_confidence
         
         logger.info(f"⚠️ Initial detections: {detection_count} fields, trying rotations...")
         
@@ -96,6 +100,7 @@ class CleanPANProcessor:
         best_image = image
         best_rotation = 0
         best_score = detection_count * avg_confidence
+        best_avg_conf = avg_confidence
         
         for angle in [90, 180, 270]:
             if angle == 90:
@@ -134,11 +139,12 @@ class CleanPANProcessor:
                 best_results = test_results
                 best_image = rotated
                 best_rotation = angle
+                best_avg_conf = test_conf
         
         if best_rotation != 0:
             logger.info(f"✅ Using {best_rotation}° rotation")
         
-        return best_results, best_image, best_rotation
+        return best_results, best_image, best_rotation, best_avg_conf
     
     def _simple_preprocess(self, image: np.ndarray, enhance_contrast: bool = True) -> np.ndarray:
         """Simple and effective preprocessing"""
@@ -231,15 +237,14 @@ class CleanPANProcessor:
             except:
                 continue
         
-        # Format the name properly
+        # Format the name properly with title case and normal spaces
         if best_name:
-            # Title case and replace spaces with underscores
-            return '_'.join(word.title() for word in best_name.split())
+            return ' '.join(word.title() for word in best_name.split())
         
         return ""
     
     def _extract_dob(self, image: np.ndarray) -> str:
-        """Extract date of birth"""
+        """Extract date of birth in YYYY-MM-DD format"""
         # Preprocess
         gray = self._simple_preprocess(image, enhance_contrast=True)
         
@@ -255,8 +260,8 @@ class CleanPANProcessor:
                     day, month, year = date_match.groups()
                     day, month, year = int(day), int(month), int(year)
                     if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2010:
-                        # Return with underscores
-                        return f"{day:02d}_{month:02d}_{year}"
+                        # Return in YYYY-MM-DD format
+                        return f"{year}-{month:02d}-{day:02d}"
                 
                 # Try without whitelist
                 text = pytesseract.image_to_string(gray, config=f'--psm {psm}').strip()
@@ -265,14 +270,14 @@ class CleanPANProcessor:
                     day, month, year = date_match.groups()
                     day, month, year = int(day), int(month), int(year)
                     if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2010:
-                        return f"{day:02d}_{month:02d}_{year}"
+                        return f"{year}-{month:02d}-{day:02d}"
                         
             except:
                 continue
         
         return ""
     
-    def process_pan_card(self, image_path: str) -> Dict[str, str]:
+    def process_pan_card(self, image_path: str) -> Dict[str, Any]:
         """Main processing pipeline for PAN card"""
         try:
             # Read image
@@ -283,13 +288,27 @@ class CleanPANProcessor:
             logger.info(f"Processing PAN card from: {image_path}")
             
             # Try detection with automatic rotation
-            results, corrected_image, rotation_used = self._try_detection_with_rotation(image)
+            results, corrected_image, rotation_used, avg_confidence = self._try_detection_with_rotation(image)
             
             if rotation_used != 0:
                 logger.info(f"🔄 Image rotated by {rotation_used}°")
             
-            # Initialize output
-            output = {
+            # Check if detections are too poor (confidence below threshold)
+            if avg_confidence < self.MIN_CONFIDENCE_THRESHOLD:
+                logger.warning(f"❌ Poor detection confidence: {avg_confidence:.3f}")
+                return {
+                    "status": False,
+                    "data": {
+                        "pan": "",
+                        "name": "",
+                        "father": "",
+                        "dob": ""
+                    },
+                    "message": "pan_notfound"
+                }
+            
+            # Initialize data dictionary
+            data = {
                 "pan": "",
                 "name": "",
                 "father": "",
@@ -323,6 +342,14 @@ class CleanPANProcessor:
                             'confidence': confidence
                         }
             
+            # Check if no valid detections found
+            if not best_detections:
+                return {
+                    "status": False,
+                    "data": data,
+                    "message": "pan_notfound"
+                }
+            
             # Extract text from each field
             for field_name, detection in best_detections.items():
                 x1, y1, x2, y2 = detection['bbox']
@@ -338,15 +365,38 @@ class CleanPANProcessor:
                 else:
                     extracted_text = ""
                 
-                output[field_name] = extracted_text
+                data[field_name] = extracted_text
                 logger.info(f"✅ {field_name}: {extracted_text if extracted_text else 'Not found'} (conf: {detection['confidence']:.3f})")
-            output["status"] = any(v is not None for k, v in output.items() if k != "status")
-
-            return output
+            
+            # Check if any field is empty
+            has_empty_fields = any(value == "" for value in data.values())
+            
+            # Determine status and message
+            if has_empty_fields:
+                status = False
+                message = "details_not_found"
+            else:
+                status = True
+                message = "pan_found"
+            
+            return {
+                "status": status,
+                "data": data,
+                "message": message
+            }
             
         except Exception as e:
             logger.error(f"Error processing PAN card: {str(e)}")
-            return {"pan": "", "name": "", "father": "", "dob": "","status":False}
+            return {
+                "status": False,
+                "data": {
+                    "pan": "",
+                    "name": "",
+                    "father": "",
+                    "dob": ""
+                },
+                "message": "pan_notfound"
+            }
 
 # FastAPI app setup
 app = FastAPI(title="Clean PAN Card Processing API", version="6.0.0")
