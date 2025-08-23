@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from ultralytics import YOLO
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import base64
 import uvicorn
+import pickle
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,12 +25,17 @@ logger = logging.getLogger(__name__)
 
 class Base64ImageRequest(BaseModel):
     image_base64: str
+    user_id: str = "default_user"
 
 class ImagePathRequest(BaseModel):
     image_path: str
+    user_id: str = "default_user"
+
+class ProcessPANRequest(BaseModel):
+    user_id: str = "default_user"
 
 class CleanPANProcessor:
-    def __init__(self, model_path='model/best_pancard.pt'):
+    def __init__(self, model_path='model/best_pancard.pt', data_dir='data'):
         """Initialize the PAN processor with clean and simple extraction"""
         
         # Dynamic device selection
@@ -47,6 +55,12 @@ class CleanPANProcessor:
         
         # Define confidence threshold for poor detections
         self.MIN_CONFIDENCE_THRESHOLD = 0.35  # Below this, consider as "pan_notfound"
+        
+        # Setup data directory for storing summaries
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+        self.pkl_path = self.data_dir / "summary.pkl"
+        self.csv_path = self.data_dir / "summary.csv"
         
         self._check_tesseract()
     
@@ -277,7 +291,53 @@ class CleanPANProcessor:
         
         return ""
     
-    def process_pan_card(self, image_path: str) -> Dict[str, Any]:
+    def check_duplicate(self, pan_number: str) -> Dict[str, Any]:
+        """Check if PAN number already exists in database"""
+        if not pan_number or not self.pkl_path.exists():
+            return None
+        
+        try:
+            with open(self.pkl_path, 'rb') as f:
+                all_data = pickle.load(f)
+            
+            for entry in all_data:
+                if entry.get('pan', '').upper() == pan_number.upper():
+                    return {
+                        'matched_user_id': entry.get('user_id', ''),
+                        'name': entry.get('name', '')
+                    }
+        except Exception as e:
+            logger.error(f"Error checking duplicates: {e}")
+        
+        return None
+    
+    def save_to_database(self, data: Dict[str, Any]):
+        """Save data to PKL and CSV files"""
+        try:
+            # Save to PKL
+            all_data = []
+            if self.pkl_path.exists():
+                with open(self.pkl_path, 'rb') as f:
+                    all_data = pickle.load(f)
+            
+            all_data.append(data)
+            
+            with open(self.pkl_path, 'wb') as f:
+                pickle.dump(all_data, f)
+            
+            # Save to CSV
+            df = pd.DataFrame([data])
+            if self.csv_path.exists():
+                df.to_csv(self.csv_path, mode='a', header=False, index=False)
+            else:
+                df.to_csv(self.csv_path, mode='w', header=True, index=False)
+            
+            logger.info(f"✅ Data saved for user: {data.get('user_id')}")
+            
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
+    
+    def process_pan_card(self, image_path: str, user_id: str = "default_user") -> Dict[str, Any]:
         """Main processing pipeline for PAN card"""
         try:
             # Read image
@@ -285,7 +345,7 @@ class CleanPANProcessor:
             if image is None:
                 raise ValueError(f"Could not read image: {image_path}")
             
-            logger.info(f"Processing PAN card from: {image_path}")
+            logger.info(f"Processing PAN card for user: {user_id}")
             
             # Try detection with automatic rotation
             results, corrected_image, rotation_used, avg_confidence = self._try_detection_with_rotation(image)
@@ -298,6 +358,7 @@ class CleanPANProcessor:
                 logger.warning(f"❌ Poor detection confidence: {avg_confidence:.3f}")
                 return {
                     "status": False,
+                    "user_id": user_id,
                     "data": {
                         "pan": "",
                         "name": "",
@@ -346,6 +407,7 @@ class CleanPANProcessor:
             if not best_detections:
                 return {
                     "status": False,
+                    "user_id": user_id,
                     "data": data,
                     "message": "pan_notfound"
                 }
@@ -371,6 +433,18 @@ class CleanPANProcessor:
             # Check if any field is empty
             has_empty_fields = any(value == "" for value in data.values())
             
+            # Check for duplicates if PAN found
+            if data['pan']:
+                duplicate = self.check_duplicate(data['pan'])
+                if duplicate:
+                    logger.warning(f"⚠️ Duplicate PAN found: {data['pan']}")
+                    return {
+                        "status": False,
+                        "matched_user_id": duplicate['matched_user_id'],
+                        "name": duplicate['name'],
+                        "message": "duplicate_found"
+                    }
+            
             # Determine status and message
             if has_empty_fields:
                 status = False
@@ -378,9 +452,21 @@ class CleanPANProcessor:
             else:
                 status = True
                 message = "pan_found"
+                
+                # Save to database if all fields are present
+                save_data = {
+                    "user_id": user_id,
+                    "pan": data["pan"],
+                    "name": data["name"],
+                    "father": data["father"],
+                    "dob": data["dob"],
+                    "timestamp": datetime.now().isoformat()
+                }
+                self.save_to_database(save_data)
             
             return {
                 "status": status,
+                "user_id": user_id,
                 "data": data,
                 "message": message
             }
@@ -389,6 +475,7 @@ class CleanPANProcessor:
             logger.error(f"Error processing PAN card: {str(e)}")
             return {
                 "status": False,
+                "user_id": user_id,
                 "data": {
                     "pan": "",
                     "name": "",
@@ -399,7 +486,7 @@ class CleanPANProcessor:
             }
 
 # FastAPI app setup
-app = FastAPI(title="Clean PAN Card Processing API", version="6.0.0")
+app = FastAPI(title="PAN Card Processing API with User Management", version="7.0.0")
 processor = None
 
 @app.on_event("startup")
@@ -423,8 +510,8 @@ def health_check():
     }
 
 @app.post("/process_pan")
-async def process_pan_file(file: UploadFile = File(...)):
-    """Process PAN card from file upload"""
+async def process_pan_file(file: UploadFile = File(...), user_id: str = "default_user"):
+    """Process PAN card from file upload with user_id"""
     try:
         if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp')):
             raise HTTPException(status_code=400, detail="Invalid file format")
@@ -435,7 +522,7 @@ async def process_pan_file(file: UploadFile = File(...)):
             content = await file.read()
             buffer.write(content)
         
-        result = processor.process_pan_card(temp_path)
+        result = processor.process_pan_card(temp_path, user_id)
         
         os.remove(temp_path)
         
@@ -455,7 +542,7 @@ async def process_pan_base64(request: Base64ImageRequest):
         with open(temp_path, 'wb') as f:
             f.write(image_data)
         
-        result = processor.process_pan_card(temp_path)
+        result = processor.process_pan_card(temp_path, request.user_id)
         
         os.remove(temp_path)
         
@@ -478,15 +565,104 @@ async def process_pan_path(request: ImagePathRequest):
             temp_path = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             with open(temp_path, 'wb') as f:
                 f.write(response.content)
-            result = processor.process_pan_card(temp_path)
+            result = processor.process_pan_card(temp_path, request.user_id)
             os.remove(temp_path)
         else:
-            result = processor.process_pan_card(request.image_path)
+            result = processor.process_pan_card(request.image_path, request.user_id)
 
         return result
     except Exception as e:
         logger.error(f"API Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+@app.get("/user/{user_id}")
+def get_user_data(user_id: str):
+    """Get user data by user_id"""
+    try:
+        if not processor.pkl_path.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"status": False, "message": "user_not_found"}
+            )
+        
+        with open(processor.pkl_path, 'rb') as f:
+            all_data = pickle.load(f)
+        
+        user_data = [entry for entry in all_data if entry.get('user_id') == user_id]
+        
+        if not user_data:
+            return JSONResponse(
+                status_code=404,
+                content={"status": False, "message": "user_not_found"}
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": True,
+                "user_id": user_id,
+                "data": user_data,
+                "message": "user_found"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching user data: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": False, "message": "error_fetching_data"}
+        )
+
+@app.delete("/user/{user_id}")
+def delete_user_data(user_id: str):
+    """Delete user data by user_id"""
+    try:
+        user_found = False
+        
+        # Delete from PKL
+        if processor.pkl_path.exists():
+            with open(processor.pkl_path, 'rb') as f:
+                all_data = pickle.load(f)
+            
+            original_length = len(all_data)
+            filtered_data = [entry for entry in all_data if entry.get('user_id') != user_id]
+            
+            if len(filtered_data) < original_length:
+                user_found = True
+                with open(processor.pkl_path, 'wb') as f:
+                    pickle.dump(filtered_data, f)
+        
+        # Delete from CSV
+        if processor.csv_path.exists():
+            df = pd.read_csv(processor.csv_path)
+            original_length = len(df)
+            df_filtered = df[df['user_id'] != user_id]
+            
+            if len(df_filtered) < original_length:
+                user_found = True
+                df_filtered.to_csv(processor.csv_path, index=False)
+        
+        if not user_found:
+            return JSONResponse(
+                status_code=404,
+                content={"status": False, "message": "user_not_found"}
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": True,
+                "user_id": user_id,
+                "message": "user_deleted"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error deleting user data: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": False, "message": "error_deleting_data"}
+        )
 
 if __name__ == '__main__':
     if not os.path.exists('model/best_pancard.pt'):
